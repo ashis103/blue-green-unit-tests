@@ -1,0 +1,127 @@
+name: CI/CD for Flask App (Blue-Green Deployment with Dockerized Tests)
+'on':
+  push:
+    branches:
+      - main
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Login to Docker Hub
+        run: >-
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+      - name: Build Docker Image with Test Stage
+        run: |
+          docker build --target tester -t flask-attendance-tester .
+      - name: Run Tests inside Docker
+        run: |
+          docker run --rm flask-attendance-tester
+      - name: Build and Push Final Image (only if tests pass)
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app .
+          docker push ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+      - name: Deploy to AWS EC2 (Blue-Green Deployment)
+        run: >
+          echo "${{ secrets.AWS_KEY }}" > private_key.pem
+
+          chmod 600 private_key.pem
+
+
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }} << 'EOF'
+
+            docker network create app_network || true
+
+            if ! docker ps --filter "name=mysql-db" | grep mysql-db; then
+              docker run -d                 --name mysql-db                 --network app_network                 -e MYSQL_ROOT_PASSWORD=root                 -e MYSQL_DATABASE=attendance_db                 -p 3306:3306                 mysql:latest
+              sleep 30
+            fi
+
+            until docker exec mysql-db mysqladmin ping -h "localhost" --silent; do
+                echo "MySQL not ready, retrying..."
+                sleep 15
+            done
+
+            # Determine Active/Idle Deployment
+            if docker ps --filter "name=flask-app-blue" | grep flask-app-blue; then
+                ACTIVE_COLOR="blue"
+                IDLE_COLOR="green"
+                IDLE_PORT=5001
+            elif docker ps --filter "name=flask-app-green" | grep flask-app-green; then
+                ACTIVE_COLOR="green"
+                IDLE_COLOR="blue"
+                IDLE_PORT=5000
+            else
+                ACTIVE_COLOR="none"
+                IDLE_COLOR="blue"
+                IDLE_PORT=5000
+            fi
+
+            echo "Active color: \$ACTIVE_COLOR"
+            echo "Deploying to: \$IDLE_COLOR (port \$IDLE_PORT)"
+
+            if [ -z "\$IDLE_PORT" ]; then
+              echo "ERROR: IDLE_PORT is not set correctly!"
+              exit 1
+            fi
+
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+            docker pull ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+
+            docker stop flask-app-\$IDLE_COLOR || true
+            docker rm flask-app-\$IDLE_COLOR || true
+            
+            if [ -z "$IDLE_PORT" ]; then
+                echo "ERROR: IDLE_PORT is not set correctly!"
+                exit 1
+            fi
+
+            docker run -d \
+              --name flask-app-$IDLE_COLOR \
+              --network app_network \
+              -p $IDLE_PORT:5000 \
+              -e DB_HOST=mysql-db \
+              -e DB_USER=root \
+              -e DB_PASSWORD=root \
+              -e DB_NAME=attendance_db \
+              ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+
+            echo "Successfully deployed to \$IDLE_COLOR"
+
+            # Correctly generate the new NGINX configuration
+            cat <<EOF_NGINX | sudo tee /etc/nginx/conf.d/bluegreen.conf
+            upstream flask_app {
+                server localhost:$IDLE_PORT;
+            }
+
+            server {
+                listen 80;
+
+                location / {
+                    proxy_pass http://flask_app;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                }
+            }
+            EOF_NGINX
+
+            sudo nginx -s reload
+            echo "Traffic switched to \$IDLE_COLOR"
+
+            # Stop and remove the old container
+            if [ "\$ACTIVE_COLOR" != "none" ]; then
+                docker stop flask-app-\$ACTIVE_COLOR || true
+                docker rm flask-app-\$ACTIVE_COLOR || true
+                echo "Removed old \$ACTIVE_COLOR container"
+            fi
+
+          EOF
