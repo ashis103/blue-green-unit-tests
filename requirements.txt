@@ -1,0 +1,4 @@
+flask
+mysql-connector-python
+pytest
+unittest-xml-reporting

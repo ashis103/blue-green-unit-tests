@@ -1,0 +1,96 @@
+name: CI/CD for Flask App (Blue-Green Deployment)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app .
+          docker push ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Deploy to AWS EC2 (Blue-Green)
+        run: |
+          echo "${{ secrets.AWS_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }} << 'EOF'
+
+            docker network create app_network || true
+
+            # Ensure MySQL is running (only create once)
+            docker ps --filter "name=mysql-db" | grep mysql-db || \
+            docker run -d \
+              --name mysql-db \
+              --network app_network \
+              -e MYSQL_ROOT_PASSWORD=rootpassword \
+              -e MYSQL_DATABASE=attendance_db \
+              -p 3306:3306 \
+              mysql:latest
+
+            # Determine current active color
+            if docker ps --filter "name=flask-app-blue" | grep flask-app-blue; then
+                ACTIVE_COLOR="blue"
+                IDLE_COLOR="green"
+                IDLE_PORT="5001"
+            else
+                ACTIVE_COLOR="green"
+                IDLE_COLOR="blue"
+                IDLE_PORT="5000"
+            fi
+
+            echo "Active: \$ACTIVE_COLOR, Deploying to: \$IDLE_COLOR"
+
+            # Pull new image and deploy to idle color
+            docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+            docker pull ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+
+            docker stop flask-app-\$IDLE_COLOR || true
+            docker rm flask-app-\$IDLE_COLOR || true
+
+            docker run -d \
+              --name flask-app-\$IDLE_COLOR \
+              --network app_network \
+              -p \$IDLE_PORT:5000 \
+              -e DB_HOST=mysql-db \
+              -e DB_USER=root \
+              -e DB_PASSWORD=rootpassword \
+              -e DB_NAME=attendance_db \
+              ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+
+            echo "Deployed new app to \$IDLE_COLOR on port \$IDLE_PORT"
+
+            # Update NGINX to point to new color
+            sudo sed -i "s/localhost:[0-9]*/localhost:\$IDLE_PORT/" /etc/nginx/conf.d/bluegreen.conf
+            sudo nginx -s reload
+
+            echo "Switched traffic to \$IDLE_COLOR"
+
+            # Optional: Clean up old container (can leave running for instant rollback)
+            docker stop flask-app-\$ACTIVE_COLOR || true
+            docker rm flask-app-\$ACTIVE_COLOR || true
+
+          EOF
